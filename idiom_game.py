@@ -1,13 +1,34 @@
 import os
 import random
 import time
+import json
+import queue
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
+try:
+    import keyboard
+except ImportError:
+    keyboard = None
+
+try:
+    import sounddevice as sd
+except ImportError:
+    sd = None
+
+try:
+    from vosk import KaldiRecognizer, Model
+except ImportError:
+    KaldiRecognizer = None
+    Model = None
 
 IDIOMS_FILE = "idioms.txt"
 SCORE_FILE = "score.txt"
 LEADERBOARD_FILE = "leaderboard.txt"
+RECORD_FILE = "record.txt"
+VOICE_MODEL_DIR = os.path.join("material", "vosk-model")
+VOICE_TRIGGER_WINDOW_SECONDS = 0.6
+VOICE_SAMPLE_RATE = 16000
 
 
 @dataclass
@@ -34,7 +55,7 @@ DEFAULT_IDIOMS = [
 
 def safe_input(prompt: str, choices=None) -> str:
     while True:
-        value = input(prompt).strip()
+        value = read_text_with_optional_voice(prompt).strip()
         if not value:
             print("输入不能为空，请重新输入。")
             continue
@@ -56,7 +77,11 @@ def parse_int_in_range(text: str, low: int, high: int) -> Optional[int]:
 
 def safe_int_input(prompt: str, low: int, high: int) -> int:
     while True:
-        raw = safe_input(prompt)
+        raw = read_text_with_optional_voice(
+            prompt,
+            validator=lambda text: parse_int_in_range(text, low, high) is not None,
+            invalid_voice_message="语音结果不是有效数字范围，已切换为键盘输入。",
+        )
         parsed = parse_int_in_range(raw, low, high)
         if parsed is not None:
             return parsed
@@ -72,11 +97,118 @@ def normalize_single_char_input(text: str) -> Optional[str]:
 
 def safe_single_char_input(prompt: str) -> str:
     while True:
-        raw = safe_input(prompt)
+        raw = read_text_with_optional_voice(
+            prompt,
+            validator=lambda text: normalize_single_char_input(text) is not None,
+            invalid_voice_message="语音结果不是单个字符，已切换为键盘输入。",
+        )
         normalized = normalize_single_char_input(raw)
         if normalized is not None:
             return normalized
         print("请只输入一个字符（支持中文）。")
+
+
+class VoiceInputEngine:
+    def __init__(self, model_path: str = VOICE_MODEL_DIR, sample_rate: int = VOICE_SAMPLE_RATE):
+        self.model_path = model_path
+        self.sample_rate = sample_rate
+        self._model = None
+        self._error_message: Optional[str] = None
+
+    def _ensure_ready(self) -> tuple[bool, Optional[str]]:
+        if self._error_message:
+            return False, self._error_message
+        if keyboard is None:
+            self._error_message = "未安装 keyboard，语音输入不可用。"
+            return False, self._error_message
+        if sd is None or Model is None or KaldiRecognizer is None:
+            self._error_message = "缺少语音依赖（sounddevice/vosk），语音输入不可用。"
+            return False, self._error_message
+        if not os.path.isdir(self.model_path):
+            self._error_message = f"未找到离线语音模型目录：{self.model_path}"
+            return False, self._error_message
+        if self._model is None:
+            try:
+                self._model = Model(self.model_path)
+            except (OSError, RuntimeError) as exc:
+                self._error_message = f"加载语音模型失败：{exc}"
+                return False, self._error_message
+        try:
+            sd.query_devices(kind="input")
+        except (OSError, ValueError) as exc:
+            return False, f"麦克风不可用：{exc}"
+        return True, None
+
+    def transcribe_while_space_held(self) -> tuple[Optional[str], Optional[str]]:
+        ready, reason = self._ensure_ready()
+        if not ready:
+            return None, reason
+        recognizer = KaldiRecognizer(self._model, self.sample_rate)
+        frames: queue.Queue[bytes] = queue.Queue()
+
+        def _callback(indata, _frames, _time, _status):
+            frames.put(bytes(indata))
+
+        print("\n检测到空格，开始语音识别（松开空格结束）...")
+        try:
+            with sd.RawInputStream(
+                samplerate=self.sample_rate,
+                blocksize=8000,
+                dtype="int16",
+                channels=1,
+                callback=_callback,
+            ):
+                while keyboard.is_pressed("space"):
+                    try:
+                        data = frames.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    recognizer.AcceptWaveform(data)
+                while not frames.empty():
+                    recognizer.AcceptWaveform(frames.get_nowait())
+        except (OSError, ValueError, RuntimeError) as exc:
+            return None, f"语音输入失败：{exc}"
+
+        try:
+            result = json.loads(recognizer.FinalResult())
+        except json.JSONDecodeError:
+            return None, "语音识别结果解析失败。"
+        text = (result.get("text") or "").strip()
+        if not text:
+            return None, "语音识别为空，请改为键盘输入。"
+        return text, None
+
+
+VOICE_ENGINE = VoiceInputEngine()
+
+
+def detect_space_hold_trigger(window_seconds: float = VOICE_TRIGGER_WINDOW_SECONDS) -> bool:
+    if keyboard is None:
+        return False
+    end_time = time.monotonic() + window_seconds
+    while time.monotonic() < end_time:
+        if keyboard.is_pressed("space"):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def read_text_with_optional_voice(
+    prompt: str,
+    validator: Optional[Callable[[str], bool]] = None,
+    invalid_voice_message: str = "语音结果不符合输入要求，已切换为键盘输入。",
+) -> str:
+    if detect_space_hold_trigger():
+        voice_text, reason = VOICE_ENGINE.transcribe_while_space_held()
+        if voice_text is None:
+            print(reason or "语音输入不可用，已切换为键盘输入。")
+        else:
+            if validator and not validator(voice_text):
+                print(invalid_voice_message)
+            else:
+                print(f"{prompt}{voice_text}")
+                return voice_text
+    return input(prompt)
 
 
 def load_idioms(path: str) -> List[Idiom]:
@@ -239,7 +371,78 @@ def choose_mode() -> str:
     return "challenge"
 
 
-def play_round(idioms: List[Idiom], hide_count: int, timed_mode: bool, learning_mode: bool) -> tuple[bool, bool]:
+def _is_pinyin_guess(value: str) -> bool:
+    return value.isascii() and value.isalpha()
+
+
+def _safe_single_guess_input(idiom_word: str) -> str:
+    max_len = len(idiom_word)
+    expect_pinyin = idiom_word.isascii()
+    while True:
+        guess = safe_input("请输入完整成语：")
+        if expect_pinyin:
+            if not _is_pinyin_guess(guess):
+                print("请输入纯字母拼音。")
+                continue
+        elif not guess.isalpha():
+            print("请输入字母或汉字，不要包含数字或特殊字符。")
+            continue
+        if len(guess) > max_len:
+            print(f"输入过长，请输入不超过 {max_len} 个字母。")
+            continue
+        return guess
+
+
+def save_game_record(
+    path: str,
+    player_name: str,
+    mode: str,
+    won: bool,
+    elapsed_seconds: float,
+    score: int,
+) -> None:
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    result = "win" if won else "loss"
+    line = f"{timestamp}:{player_name}:{mode}:{result}:{elapsed_seconds:.2f}:{score}\n"
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError as exc:
+        print(f"保存游戏记录失败（{exc}）。")
+
+
+def parse_record_line(line: str) -> Optional[dict]:
+    raw = line.strip()
+    parts = raw.split(":")
+    if len(parts) < 8:
+        return None
+    timestamp = ":".join(parts[0:3])
+    player_name, mode, result = parts[3], parts[4], parts[5]
+    elapsed_text, score_text = parts[6], parts[7]
+    if result not in {"win", "loss"}:
+        return None
+    try:
+        elapsed_seconds = float(elapsed_text)
+        score = int(score_text)
+    except ValueError:
+        return None
+    return {
+        "timestamp": timestamp,
+        "player_name": player_name,
+        "mode": mode,
+        "won": result == "win",
+        "elapsed_seconds": elapsed_seconds,
+        "score": score,
+    }
+
+
+def play_round(
+    idioms: List[Idiom],
+    hide_count: int,
+    timed_mode: bool,
+    learning_mode: bool,
+    input_func: Optional[Callable[[str], str]] = None,
+) -> tuple[bool, bool, float]:
     idiom = random.choice(idioms)
     attempts = 3
     used_hint = False
@@ -255,6 +458,7 @@ def play_round(idioms: List[Idiom], hide_count: int, timed_mode: bool, learning_
     if timed_mode:
         print("限时模式：本局 30 秒。")
 
+    guess_reader = input_func or _safe_single_guess_input
     while attempts > 0:
         if timed_mode:
             elapsed = time.monotonic() - start
@@ -266,17 +470,22 @@ def play_round(idioms: List[Idiom], hide_count: int, timed_mode: bool, learning_
         else:
             print(f"\n剩余机会：{attempts}")
 
-        guess = safe_input("请输入完整成语：")
+        guess = guess_reader(idiom.word)
         if guess == idiom.word:
             print("恭喜你，猜对了！")
-            return True, used_hint
+            return True, used_hint, time.monotonic() - start
 
         attempts -= 1
         if attempts > 0:
             print("猜错了。")
-            if attempts == 2 and not used_hint and ask_yes_no("是否使用提示（显示第一个字，扣2分）？(y/n)："):
-                print(f"提示：第一个字是“{idiom.word[0]}”")
+            if attempts == 2 and not used_hint and ask_yes_no("是否使用提示（显示最后一个字，扣2分）？(y/n)："):
+                print(f"提示：最后一个字是“{idiom.word[-1]}”")
                 used_hint = True
+            elif attempts == 1:
+                if len(idiom.word) >= 2:
+                    print(f"提示：第二个字是“{idiom.word[1]}”")
+                else:
+                    print(f"提示：唯一的字是“{idiom.word[0]}”")
             if learning_mode:
                 print(f"学习提示：{idiom.description}")
                 if idiom.example:
@@ -286,7 +495,7 @@ def play_round(idioms: List[Idiom], hide_count: int, timed_mode: bool, learning_
     print(f"解释：{idiom.description}")
     if idiom.example:
         print(f"例句：{idiom.example}")
-    return False, used_hint
+    return False, used_hint, time.monotonic() - start
 
 
 def run_single_mode(idioms: List[Idiom]) -> None:
@@ -308,7 +517,7 @@ def run_single_mode(idioms: List[Idiom]) -> None:
             print("该分类暂无成语，请重新选择。")
             continue
 
-        won, used_hint = play_round(round_pool, hide_count, timed_mode, learning_mode)
+        won, used_hint, elapsed_seconds = play_round(round_pool, hide_count, timed_mode, learning_mode)
         if won:
             gain = 10 - (2 if used_hint else 0)
             score += gain
@@ -322,6 +531,7 @@ def run_single_mode(idioms: List[Idiom]) -> None:
             streak = 0
             print(f"本局失败，当前总分：{score}")
 
+        save_game_record(RECORD_FILE, player_name, "single", won, elapsed_seconds, score)
         board = update_leaderboard(LEADERBOARD_FILE, player_name, score)
         print_leaderboard(board)
 
@@ -436,20 +646,12 @@ def play_description_challenge_mode(idioms: List[Idiom]) -> Tuple[str, int]:
 
 
 def main() -> None:
-    random.seed()
-    idioms = load_idioms(IDIOMS_FILE)
-    mode = choose_mode()
-    if mode == "single":
-        run_single_mode(idioms)
-    elif mode == "battle":
-        winner, score = play_battle_mode(idioms)
-        if winner:
-            board = update_leaderboard(LEADERBOARD_FILE, winner, score)
-            print_leaderboard(board)
-    else:
-        player_name, score = play_description_challenge_mode(idioms)
-        board = update_leaderboard(LEADERBOARD_FILE, player_name, score)
-        print_leaderboard(board)
+    print("CLI 模式已下线，正在启动 GTK 图形界面...")
+    try:
+        from idiom_game_gtk import main as gtk_main
+    except Exception as exc:
+        raise SystemExit(f"GTK 启动失败：{exc}\n请直接运行：python idiom_game_gtk.py") from exc
+    gtk_main()
 
 
 if __name__ == "__main__":
